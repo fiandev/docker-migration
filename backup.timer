@@ -1,0 +1,14 @@
+# Template installed by: sudo ./main.sh install-service
+# Runs twice daily at 02:00 and 14:00.
+
+[Unit]
+Description=Run Docker migration backup twice daily
+
+[Timer]
+OnCalendar=*-*-* 02,14:00:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=backup.service
+
+[Install]
+WantedBy=timers.target
