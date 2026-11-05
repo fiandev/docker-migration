@@ -70,6 +70,12 @@ load_env
 
 CHUNK_SIZE="${DEFAULT_CHUNK_SIZE:-50m}"
 
+# Storage hygiene.
+KEEP_ARCHIVE="${KEEP_ARCHIVE:-false}"
+CLEANUP_SOURCE="${CLEANUP_SOURCE:-true}"
+CLEANUP_AFTER_UPLOAD="${CLEANUP_AFTER_UPLOAD:-false}"
+RETENTION_COUNT="${RETENTION_COUNT:-0}"
+
 WORK_DIR="${WORK_DIR:-/root}"
 LATEST_FILE="${LATEST_FILE:-${WORK_DIR}/docker-migration-latest}"
 
@@ -78,6 +84,7 @@ SEVENZIP="$(command -v 7z || command -v 7zz || true)"
 # Telegram state (populated by init_telegram).
 TELEGRAM_ENABLED=0
 TELEGRAM_FAILURE_SENT=0
+TELEGRAM_UPLOAD_OK=0
 BACKUP_START=0
 RESTORE_START=0
 
@@ -258,12 +265,16 @@ init_telegram() {
     TELEGRAM_TOPIC_ID="${TELEGRAM_TOPIC_ID:-}"
     TELEGRAM_MAX_FILE_MB="${TELEGRAM_MAX_FILE_MB:-49}"
     TELEGRAM_TIMEOUT="${TELEGRAM_TIMEOUT:-30}"
+    TELEGRAM_UPLOAD_TIMEOUT="${TELEGRAM_UPLOAD_TIMEOUT:-120}"
 
     [[ "$TELEGRAM_MAX_FILE_MB" =~ ^[0-9]+$ ]] \
         || TELEGRAM_MAX_FILE_MB=49
 
     [[ "$TELEGRAM_TIMEOUT" =~ ^[0-9]+$ ]] \
         || TELEGRAM_TIMEOUT=30
+
+    [[ "$TELEGRAM_UPLOAD_TIMEOUT" =~ ^[0-9]+$ ]] \
+        || TELEGRAM_UPLOAD_TIMEOUT=120
 
     if [[ -z "$TELEGRAM_BOT_TOKEN" && -z "$TELEGRAM_CHAT_ID" ]]; then
         if is_true "${TELEGRAM_REQUIRED:-false}"; then
@@ -299,11 +310,18 @@ tg_api() {
     shift
 
     local response http_code body
+    local max_time="${TG_API_MAX_TIME:-$TELEGRAM_TIMEOUT}"
+    local retries="${TG_API_RETRIES:-2}"
+
+    local -a retry_args=()
+    if ((retries > 0)); then
+        retry_args=(--retry "$retries" --retry-delay 2 --retry-connrefused)
+    fi
 
     response="$(curl --silent --show-error \
         --connect-timeout 10 \
-        --max-time "$TELEGRAM_TIMEOUT" \
-        --retry 2 --retry-delay 2 --retry-connrefused \
+        --max-time "$max_time" \
+        "${retry_args[@]}" \
         --write-out $'\n%{http_code}' \
         "${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/${method}" \
         "$@" 2>&1)" || true
@@ -358,6 +376,11 @@ tg_send_document() {
         return 1
     fi
 
+    if [[ ! -r "$file" ]]; then
+        warn "File not readable: $file"
+        return 1
+    fi
+
     local size_bytes max_bytes
     size_bytes="$(wc -c < "$file")"
     max_bytes=$((TELEGRAM_MAX_FILE_MB * 1024 * 1024))
@@ -369,24 +392,40 @@ tg_send_document() {
 
     caption="${caption:0:1000}"
 
+    # A 49 MB upload can take minutes on a slow VPS: the API timeout is
+    # scaled with the file size instead of using the 30s message timeout.
+    local upload_timeout=$((TELEGRAM_UPLOAD_TIMEOUT + size_bytes / 131072))
+
     local -a args=(
         -F "chat_id=${TELEGRAM_CHAT_ID}"
         -F "document=@${file}"
     )
 
     if [[ -n "$caption" ]]; then
-        args+=(-F "caption=${caption}" -F "parse_mode=HTML")
+        # --form-string is required here: -F treats a value that starts with
+        # '<' or '@' as a local file, so an HTML caption
+        # ("<b>...</b>") made curl fail with
+        # "curl: (26) Failed to open/read local data" on every upload.
+        args+=(--form-string "caption=${caption}" -F "parse_mode=HTML")
     fi
 
     if [[ -n "$TELEGRAM_TOPIC_ID" ]]; then
-        args+=(-F "message_thread_id=${TELEGRAM_TOPIC_ID}")
+        args+=(--form-string "message_thread_id=${TELEGRAM_TOPIC_ID}")
     fi
 
     if is_true "${TELEGRAM_SILENT:-false}"; then
-        args+=(-F "disable_notification=true")
+        args+=(--form-string "disable_notification=true")
     fi
 
-    tg_api sendDocument "${args[@]}"
+    local rc=0
+
+    TG_API_MAX_TIME="$upload_timeout"
+    TG_API_RETRIES=1
+    tg_api sendDocument "${args[@]}" || rc=$?
+    TG_API_MAX_TIME=""
+    TG_API_RETRIES=""
+
+    return "$rc"
 }
 
 tg_notify_failure() {
@@ -440,18 +479,47 @@ tg_notify_backup() {
     echo
     echo "Sending files to Telegram..."
 
-    tg_send_document \
+    local sent=0
+    local failed=0
+
+    if tg_send_document \
         "${output}/SHA256SUMS" \
-        "<b>SHA256SUMS</b> — $(tg_escape "$name")" || true
+        "<b>SHA256SUMS</b> — $(tg_escape "$name")"; then
+        sent=$((sent + 1))
+    else
+        failed=$((failed + 1))
+    fi
 
     local chunk
     for chunk in "${output}/${name}.part-"*; do
         [[ -f "$chunk" ]] || continue
 
-        tg_send_document \
+        if tg_send_document \
             "$chunk" \
-            "<b>$(tg_escape "$(basename "$chunk")")</b>" || true
+            "<b>$(tg_escape "$(basename "$chunk")")</b>"; then
+            sent=$((sent + 1))
+        else
+            failed=$((failed + 1))
+        fi
     done
+
+    echo "Telegram upload: ${sent} sent, ${failed} failed."
+
+    if ((failed > 0)); then
+        tg_send_message "$(
+            printf '%s\n' \
+                "⚠️ <b>Telegram upload incomplete</b>" \
+                "" \
+                "<b>Sent:</b> ${sent}" \
+                "<b>Failed:</b> ${failed}" \
+                "<b>Host:</b> $(tg_escape "$(uname -n)")"
+        )" || true
+
+        return 1
+    fi
+
+    TELEGRAM_UPLOAD_OK=1
+    return 0
 }
 
 tg_notify_restore() {
@@ -481,6 +549,30 @@ on_error() {
 # ============================================================
 # BACKUP
 # ============================================================
+
+# Keep only the newest $1 encrypted backups (0 disables pruning).
+cleanup_old_backups() {
+    local keep="${1:-0}"
+
+    [[ "$keep" =~ ^[0-9]+$ ]] || return 0
+    ((keep > 0)) || return 0
+
+    local -a old=()
+    mapfile -t old < <(
+        find "$WORK_DIR" -maxdepth 1 -type d \
+            -name 'docker-migration-*-encrypted' -printf '%f\n' \
+            | sort -r \
+            | tail -n "+$((keep + 1))"
+    )
+
+    local dir
+    for dir in "${old[@]}"; do
+        [[ -n "$dir" ]] || continue
+
+        echo "Pruning old backup: ${WORK_DIR}/${dir}"
+        rm -rf -- "${WORK_DIR}/${dir}" "${WORK_DIR}/${dir%-encrypted}"
+    done
+}
 
 backup() {
     local BACKUP
@@ -906,6 +998,29 @@ backup() {
         sha256sum "${NAME}.part-"* > SHA256SUMS
     )
 
+    # The chunks must rebuild the archive byte for byte before either the
+    # archive or the unencrypted source is removed.
+    local parts_total=0
+    local part
+
+    for part in "$OUTPUT/${NAME}.part-"*; do
+        parts_total=$((parts_total + $(stat -c %s "$part")))
+    done
+
+    local archive_size
+    archive_size="$(stat -c %s "$ARCHIVE")"
+
+    ((parts_total == archive_size)) \
+        || die "Chunk size mismatch: ${parts_total} != ${archive_size}"
+
+    local archive_checksum
+    archive_checksum="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+
+    if ! is_true "${KEEP_ARCHIVE:-false}"; then
+        rm -f -- "$ARCHIVE"
+        echo "Archive removed (the chunks hold the same data): $ARCHIVE"
+    fi
+
     echo
     echo "========================================"
     echo " BACKUP COMPLETE"
@@ -913,6 +1028,15 @@ backup() {
 
     echo "Source:    $BACKUP"
     echo "Encrypted: $OUTPUT"
+
+    if is_true "${CLEANUP_SOURCE:-true}"; then
+        echo "Removing unencrypted source: $BACKUP"
+        rm -rf -- "$BACKUP"
+
+        # The source path no longer exists, point LATEST_FILE at the
+        # encrypted folder instead of leaving a dangling path.
+        printf '%s\n' "$OUTPUT" > "$LATEST_FILE"
+    fi
 
     du -sh "$OUTPUT"
 
@@ -925,14 +1049,13 @@ backup() {
     chunk_count="$(find "$OUTPUT" -maxdepth 1 -type f \
         -name "${NAME}.part-*" | wc -l)"
 
-    local archive_checksum
-    archive_checksum="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
-
     local duration=$((SECONDS - BACKUP_START))
 
     echo
     echo "Chunks:    $chunk_count"
     echo "Duration:  $(format_duration "$duration")"
+
+    local upload_status=0
 
     tg_notify_backup \
         "$BACKUP" \
@@ -941,7 +1064,24 @@ backup() {
         "$chunk_count" \
         "$total_size" \
         "$archive_checksum" \
-        "$duration"
+        "$duration" || upload_status=$?
+
+    if is_true "${CLEANUP_AFTER_UPLOAD:-false}"; then
+        if [[ "$TELEGRAM_UPLOAD_OK" == 1 ]]; then
+            echo
+            echo "Removing local chunks (already uploaded to Telegram): $OUTPUT"
+            rm -rf -- "$OUTPUT"
+            rm -f -- "$LATEST_FILE"
+        else
+            warn "CLEANUP_AFTER_UPLOAD=true but the Telegram upload did not complete; keeping $OUTPUT"
+        fi
+    fi
+
+    if ((upload_status != 0)); then
+        warn "Backup is complete, but not every chunk reached Telegram."
+    fi
+
+    cleanup_old_backups "${RETENTION_COUNT:-0}"
 }
 
 # ============================================================

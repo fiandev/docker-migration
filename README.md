@@ -57,9 +57,14 @@ Variables already exported in the shell take precedence over `.env` values.
 | `TELEGRAM_MAX_FILE_MB` | Maximum file size to upload, in MiB | `49` |
 | `TELEGRAM_SILENT` | Send notifications without sound | `false` |
 | `TELEGRAM_TIMEOUT` | Telegram HTTP timeout in seconds | `30` |
+| `TELEGRAM_UPLOAD_TIMEOUT` | Base timeout for document uploads in seconds; grows with file size | `120` |
 | `TELEGRAM_REQUIRED` | Fail when Telegram is not configured | `false` |
 | `BACKUP_PASSWORD` | Archive encryption password | empty |
 | `DEFAULT_CHUNK_SIZE` | Default chunk size when no CLI argument is given | `50m` |
+| `KEEP_ARCHIVE` | Keep the full `.7z` next to the chunks | `false` |
+| `CLEANUP_SOURCE` | Delete the unencrypted source folder after the archive is verified | `true` |
+| `CLEANUP_AFTER_UPLOAD` | Delete local chunks after Telegram confirms every upload | `false` |
+| `RETENTION_COUNT` | Keep only the newest N encrypted backups (`0` = all) | `0` |
 | `WORK_DIR` | Working directory for backups | `/root` |
 | `ENV_FILE` | Override the `.env` path | `<script-dir>/.env` |
 
@@ -91,6 +96,19 @@ The script creates two directories under `WORK_DIR`:
 
 The latest source path is written to `${WORK_DIR}/docker-migration-latest`
 (`/root/docker-migration-latest` by default).
+
+By default the backup is reduced to the encrypted chunks only:
+
+1. The archive is verified with `7z t`.
+2. The archive is split and every chunk is checksummed into `SHA256SUMS`.
+3. The chunk sizes are verified against the archive size.
+4. The full `.7z` is deleted (`KEEP_ARCHIVE=false`).
+5. The unencrypted source folder is deleted (`CLEANUP_SOURCE=true`), and
+   `docker-migration-latest` is pointed at the encrypted folder.
+
+Set `CLEANUP_AFTER_UPLOAD=true` to also delete the local chunks once all of
+them have been uploaded to Telegram. In that case the Telegram chat is the only
+copy. `RETENTION_COUNT` prunes old backup folders after each successful run.
 
 ### Restore
 
@@ -182,9 +200,13 @@ sudo ./main.sh uninstall-service
 6. Archive named volumes and bind mounts.
 7. Restart the containers that were running before the backup.
 8. Generate `SHA256SUMS`.
-9. Encrypt the backup with 7-Zip.
-10. Split the encrypted archive into chunks.
-11. Send Telegram notifications and, optionally, upload the chunks.
+9. Encrypt the backup with 7-Zip and verify the archive.
+10. Split the encrypted archive into chunks and checksum them.
+11. Delete the archive and the unencrypted source (`KEEP_ARCHIVE`,
+    `CLEANUP_SOURCE`).
+12. Send Telegram notifications and, optionally, upload the chunks.
+13. Optionally delete the local chunks after a complete upload
+    (`CLEANUP_AFTER_UPLOAD`) and prune old backups (`RETENTION_COUNT`).
 
 ### Restore
 
