@@ -17,6 +17,7 @@ umask 077
 # Usage:
 #   ./main.sh backup [chunk-size]
 #   ./main.sh restore /path/to/encrypted-folder
+#   ./main.sh restore-telegram [manifest|file-id]
 #   ./main.sh telegram-test
 #   ./main.sh install-service
 #   ./main.sh uninstall-service
@@ -87,6 +88,13 @@ TELEGRAM_FAILURE_SENT=0
 TELEGRAM_UPLOAD_OK=0
 BACKUP_START=0
 RESTORE_START=0
+
+# Last Telegram API payload and the file_id of the last uploaded document.
+TG_LAST_RESPONSE=""
+TG_DOCUMENT_FILE_ID=""
+TG_DOCUMENT_UNIQUE_ID=""
+TG_DOCUMENT_MESSAGE_ID=""
+TG_FILE_PATH=""
 
 # ============================================================
 # COMMON FUNCTIONS
@@ -329,12 +337,91 @@ tg_api() {
     http_code="${response##*$'\n'}"
     body="${response%$'\n'*}"
 
+    TG_LAST_RESPONSE="$body"
+
     if [[ "$http_code" == "200" ]]; then
         return 0
     fi
 
     warn "Telegram ${method} failed (HTTP ${http_code:-?}): ${body:0:300}"
     return 1
+}
+
+# Extract the first "$key":"value" from a JSON payload. The Bot API
+# responses are compact and the field we need always appears before any
+# nested object (thumbnail, etc.), so a regex is enough and avoids a
+# hard dependency on jq.
+tg_json_string() {
+    local key="$1"
+    local json="${2:-${TG_LAST_RESPONSE:-}}"
+
+    printf '%s' "$json" \
+        | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -n 1 \
+        | sed -E 's/^[^:]*:[[:space:]]*"//; s/"$//' \
+        || true
+}
+
+tg_json_number() {
+    local key="$1"
+    local json="${2:-${TG_LAST_RESPONSE:-}}"
+
+    printf '%s' "$json" \
+        | grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" \
+        | head -n 1 \
+        | sed -E 's/^[^:]*:[[:space:]]*//' \
+        || true
+}
+
+# Resolve a Telegram file_id to a temporary download path.
+tg_get_file_path() {
+    local file_id="$1"
+
+    TG_FILE_PATH=""
+
+    tg_api getFile \
+        --data-urlencode "file_id=${file_id}" \
+        || return 1
+
+    TG_FILE_PATH="$(tg_json_string file_path)"
+
+    if [[ -z "$TG_FILE_PATH" ]]; then
+        warn "Telegram did not return a file path for: $file_id"
+        return 1
+    fi
+}
+
+# $1 = Telegram file_id, $2 = destination path.
+tg_download_file() {
+    local file_id="$1"
+    local dest="$2"
+
+    [[ "$TELEGRAM_ENABLED" == 1 ]] || return 1
+
+    tg_get_file_path "$file_id" || return 1
+
+    local file_size
+    file_size="$(tg_json_number file_size)"
+    [[ "$file_size" =~ ^[0-9]+$ ]] || file_size=0
+
+    local download_timeout=$((TELEGRAM_UPLOAD_TIMEOUT + file_size / 131072))
+    local tmp="${dest}.part"
+
+    mkdir -p -- "$(dirname "$dest")"
+
+    if ! curl --silent --show-error --fail \
+        --connect-timeout 10 \
+        --max-time "$download_timeout" \
+        --retry 2 --retry-delay 2 --retry-connrefused \
+        -o "$tmp" \
+        "${TELEGRAM_API_BASE}/file/bot${TELEGRAM_BOT_TOKEN}/${TG_FILE_PATH}"; then
+
+        rm -f -- "$tmp"
+        warn "Telegram download failed: $file_id"
+        return 1
+    fi
+
+    mv -f -- "$tmp" "$dest"
 }
 
 # $1 = HTML message. Escape dynamic values with tg_escape first.
@@ -420,11 +507,21 @@ tg_send_document() {
 
     local rc=0
 
+    TG_DOCUMENT_FILE_ID=""
+    TG_DOCUMENT_UNIQUE_ID=""
+    TG_DOCUMENT_MESSAGE_ID=""
+
     TG_API_MAX_TIME="$upload_timeout"
     TG_API_RETRIES=1
     tg_api sendDocument "${args[@]}" || rc=$?
     TG_API_MAX_TIME=""
     TG_API_RETRIES=""
+
+    if ((rc == 0)); then
+        TG_DOCUMENT_FILE_ID="$(tg_json_string file_id)"
+        TG_DOCUMENT_UNIQUE_ID="$(tg_json_string file_unique_id)"
+        TG_DOCUMENT_MESSAGE_ID="$(tg_json_number message_id)"
+    fi
 
     return "$rc"
 }
@@ -482,29 +579,73 @@ tg_notify_backup() {
 
     local sent=0
     local failed=0
+    local complete=1
+
+    local manifest="${output}/${name}-telegram-manifest.tsv"
+    local manifest_copy="${WORK_DIR}/${name}-telegram-manifest.tsv"
+
+    local -a file_rows=()
+
+    local file expected_sha
+    for file in "${output}/SHA256SUMS" "${output}/${name}.part-"*; do
+        [[ -f "$file" ]] || continue
+
+        expected_sha="$(awk -v f="$(basename "$file")" \
+            '$2 == f { print $1; exit }' \
+            "${output}/SHA256SUMS" 2>/dev/null || true)"
+
+        if [[ -z "$expected_sha" ]]; then
+            expected_sha="$(sha256sum "$file" | awk '{print $1}')"
+        fi
+
+        if tg_send_document \
+            "$file" \
+            "<b>$(tg_escape "$(basename "$file")")</b>"; then
+            sent=$((sent + 1))
+
+            file_rows+=("$(printf 'file\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$(basename "$file")" \
+                "$(stat -c %s "$file")" \
+                "$expected_sha" \
+                "${TG_DOCUMENT_FILE_ID:-}" \
+                "${TG_DOCUMENT_UNIQUE_ID:-}" \
+                "${TG_DOCUMENT_MESSAGE_ID:-}")")
+        else
+            failed=$((failed + 1))
+            complete=0
+        fi
+    done
+
+    # The manifest maps every Telegram file_id back to its chunk, so a
+    # restore can fetch the whole backup without downloading it by hand.
+    {
+        printf '# docker-migration telegram manifest v1\n'
+        printf 'name\t%s\n' "$name"
+        printf 'host\t%s\n' "$(uname -n)"
+        printf 'created\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+        printf 'chunk_size\t%s\n' "$CHUNK_SIZE"
+        printf 'archive_sha256\t%s\n' "$checksum"
+        printf 'complete\t%s\n' "$complete"
+
+        if ((${#file_rows[@]})); then
+            printf '%s\n' "${file_rows[@]}"
+        fi
+    } > "$manifest"
+
+    chmod 600 "$manifest"
+    cp -f -- "$manifest" "$manifest_copy"
+    chmod 600 "$manifest_copy"
 
     if tg_send_document \
-        "${output}/SHA256SUMS" \
-        "<b>SHA256SUMS</b> — $(tg_escape "$name")"; then
+        "$manifest" \
+        "<b>Restore manifest</b> — $(tg_escape "$name")"; then
         sent=$((sent + 1))
     else
         failed=$((failed + 1))
     fi
 
-    local chunk
-    for chunk in "${output}/${name}.part-"*; do
-        [[ -f "$chunk" ]] || continue
-
-        if tg_send_document \
-            "$chunk" \
-            "<b>$(tg_escape "$(basename "$chunk")")</b>"; then
-            sent=$((sent + 1))
-        else
-            failed=$((failed + 1))
-        fi
-    done
-
     echo "Telegram upload: ${sent} sent, ${failed} failed."
+    echo "Restore manifest: $manifest_copy"
 
     if ((failed > 0)); then
         tg_send_message "$(
@@ -513,7 +654,8 @@ tg_notify_backup() {
                 "" \
                 "<b>Sent:</b> ${sent}" \
                 "<b>Failed:</b> ${failed}" \
-                "<b>Host:</b> $(tg_escape "$(uname -n)")"
+                "<b>Host:</b> $(tg_escape "$(uname -n)")" \
+                "<b>Manifest:</b> <code>$(tg_escape "$manifest_copy")</code>"
         )" || true
 
         return 1
@@ -572,6 +714,25 @@ cleanup_old_backups() {
 
         echo "Pruning old backup: ${WORK_DIR}/${dir}"
         rm -rf -- "${WORK_DIR}/${dir}" "${WORK_DIR}/${dir%-encrypted}"
+        rm -f -- "${WORK_DIR}/${dir%-encrypted}-telegram-manifest.tsv"
+    done
+
+    # With CLEANUP_AFTER_UPLOAD=true the encrypted folder is gone, so the
+    # manifest copies have to be pruned on their own.
+    local -a old_manifests=()
+    mapfile -t old_manifests < <(
+        find "$WORK_DIR" -maxdepth 1 -type f \
+            -name 'docker-migration-*-telegram-manifest.tsv' -printf '%f\n' \
+            | sort -r \
+            | tail -n "+$((keep + 1))"
+    )
+
+    local manifest
+    for manifest in "${old_manifests[@]}"; do
+        [[ -n "$manifest" ]] || continue
+
+        echo "Pruning old manifest: ${WORK_DIR}/${manifest}"
+        rm -f -- "${WORK_DIR}/${manifest}"
     done
 }
 
@@ -1499,6 +1660,153 @@ restore() {
 }
 
 # ============================================================
+# RESTORE FROM TELEGRAM
+# ============================================================
+
+# Download the encrypted chunks listed in a Telegram manifest, then hand
+# the folder to the normal restore flow. The manifest is a small tab
+# separated file produced by the backup:
+#
+#   name        docker-migration-YYYYMMDD-HHMMSS
+#   complete    1
+#   file        <chunk name> <size> <sha256> <file_id> <file_unique_id> <message_id>
+restore_telegram() {
+    local SOURCE="${2:-}"
+    local MANIFEST=""
+    local MANIFEST_TMP=""
+
+    [[ "$TELEGRAM_ENABLED" == 1 ]] \
+        || die "Telegram is not configured. Fill in ${ENV_FILE} first."
+
+    if [[ -n "$SOURCE" && -f "$SOURCE" ]]; then
+        MANIFEST="$SOURCE"
+    elif [[ -n "$SOURCE" ]]; then
+        MANIFEST_TMP="$(mktemp "${WORK_DIR}/telegram-manifest.XXXXXX")"
+        MANIFEST="$MANIFEST_TMP"
+
+        echo "Downloading manifest from Telegram: $SOURCE"
+        tg_download_file "$SOURCE" "$MANIFEST" \
+            || die "Failed to download the manifest from Telegram."
+    else
+        MANIFEST="$(find "$WORK_DIR" -maxdepth 1 -type f \
+            -name '*-telegram-manifest.tsv' \
+            -printf '%T@\t%p\n' 2>/dev/null \
+            | sort -nr \
+            | head -n 1 \
+            | cut -f2- || true)"
+
+        [[ -n "$MANIFEST" ]] \
+            || die "Usage: $0 restore-telegram /path/to/manifest.tsv|telegram-file-id"
+
+        echo "Using latest local manifest: $MANIFEST"
+    fi
+
+    [[ -r "$MANIFEST" ]] \
+        || die "Manifest is not readable: $MANIFEST"
+
+    local NAME=""
+    local COMPLETE=""
+
+    local -a F_NAMES=()
+    local -a F_SIZES=()
+    local -a F_SHAS=()
+    local -a F_IDS=()
+
+    local key a b c d e f
+    while IFS=$'\t' read -r key a b c d e f || [[ -n "$key" ]]; do
+        case "$key" in
+            '' | '#'*) continue ;;
+            name) NAME="$a" ;;
+            complete) COMPLETE="$a" ;;
+            file)
+                [[ -n "$a" && -n "$d" ]] \
+                    || die "Invalid file entry in manifest: $MANIFEST"
+
+                F_NAMES+=("$a")
+                F_SIZES+=("$b")
+                F_SHAS+=("$c")
+                F_IDS+=("$d")
+                ;;
+        esac
+    done < "$MANIFEST"
+
+    if [[ -n "$MANIFEST_TMP" ]]; then
+        rm -f -- "$MANIFEST_TMP"
+    fi
+
+    [[ -n "$NAME" ]] \
+        || die "Invalid manifest: backup name is missing."
+
+    [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "Invalid backup name in manifest: $NAME"
+
+    [[ -z "$COMPLETE" || "$COMPLETE" == 1 ]] \
+        || die "Manifest is incomplete: the Telegram upload did not finish."
+
+    ((${#F_NAMES[@]})) \
+        || die "Invalid manifest: no files listed."
+
+    local TARGET_DIR="${WORK_DIR}/${NAME}-encrypted"
+
+    mkdir -p -- "$TARGET_DIR"
+    chmod 700 "$TARGET_DIR"
+
+    echo
+    echo "Downloading ${#F_NAMES[@]} file(s) from Telegram..."
+    echo "Target: $TARGET_DIR"
+
+    local i fname fsize fsha file_id dest actual_size actual_sha
+    for i in "${!F_NAMES[@]}"; do
+        fname="${F_NAMES[$i]}"
+        fsize="${F_SIZES[$i]}"
+        fsha="${F_SHAS[$i]}"
+        file_id="${F_IDS[$i]}"
+
+        [[ "$fname" == "$(basename "$fname")" &&
+            "$fname" != "." && "$fname" != ".." ]] \
+            || die "Unsafe file name in manifest: $fname"
+
+        dest="${TARGET_DIR}/${fname}"
+
+        # Allow re-running a partial restore: keep files that already
+        # match the checksum from the manifest.
+        if [[ -f "$dest" && -n "$fsha" ]]; then
+            actual_sha="$(sha256sum "$dest" | awk '{print $1}')"
+
+            if [[ "$actual_sha" == "$fsha" ]]; then
+                echo "Skip (already downloaded): $fname"
+                continue
+            fi
+        fi
+
+        echo "Download: $fname"
+
+        tg_download_file "$file_id" "$dest" \
+            || die "Failed to download: $fname"
+
+        if [[ -n "$fsize" ]]; then
+            actual_size="$(stat -c %s "$dest")"
+
+            ((actual_size == fsize)) \
+                || die "Size mismatch for ${fname}: ${actual_size} != ${fsize}"
+        fi
+
+        if [[ -n "$fsha" ]]; then
+            actual_sha="$(sha256sum "$dest" | awk '{print $1}')"
+
+            [[ "$actual_sha" == "$fsha" ]] \
+                || die "Checksum mismatch for: $fname"
+        fi
+    done
+
+    echo
+    echo "All files downloaded and verified."
+    echo "Downloaded files are kept in: $TARGET_DIR"
+
+    restore restore "$TARGET_DIR"
+}
+
+# ============================================================
 # ENTRY POINT
 # ============================================================
 
@@ -1512,6 +1820,7 @@ Docker Migration Manager
 Usage:
   ${script} backup [chunk-size]
   ${script} restore /path/to/encrypted-folder
+  ${script} restore-telegram [manifest.tsv|telegram-file-id]
   ${script} telegram-test
   ${script} install-service
   ${script} uninstall-service
@@ -1522,6 +1831,8 @@ Config:
 Examples:
   ${script} backup 45m
   ${script} restore /root/docker-migration-xxx-encrypted
+  ${script} restore-telegram
+  ${script} restore-telegram /root/docker-migration-xxx-telegram-manifest.tsv
 EOF
 }
 
@@ -1543,6 +1854,13 @@ case "$MODE" in
         require_commands
         RESTORE_START=$SECONDS
         restore "$@"
+        ;;
+
+    restore-telegram)
+        require_root
+        require_commands
+        RESTORE_START=$SECONDS
+        restore_telegram "$@"
         ;;
 
     telegram-test)

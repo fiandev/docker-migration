@@ -20,6 +20,7 @@ and can be reported or uploaded to Telegram through a bot.
 - Restore with checksum verification and destructive-action confirmation
 - Telegram success/failure notifications
 - Optional Telegram upload of encrypted chunks
+- Telegram restore manifest (`file_id` per chunk) and automatic download
 - systemd service and timer for scheduled backups twice a day
 
 ## Requirements
@@ -28,7 +29,9 @@ and can be reported or uploaded to Telegram through a bot.
 - Root access
 - Docker Engine and the Docker Compose plugin
 - `7z` or `7zz`
-- `tar`, `split`, `sha256sum`, `base64`, `realpath`, `curl`, `find`, `awk`
+- `tar`, `split`, `sha256sum`, `base64`, `realpath`, `curl`
+- Standard utilities: `find`, `grep`, `sed`, `awk`, `sort`, `head`, `cut`,
+  `stat`, `xargs`, `du`, `wc`, `mktemp`
 - systemd, only for scheduled backups
 
 ## Installation
@@ -53,7 +56,7 @@ Variables already exported in the shell take precedence over `.env` values.
 | `TELEGRAM_BOT_TOKEN` | Bot token from `@BotFather` | empty |
 | `TELEGRAM_CHAT_ID` | Target chat, group, or channel ID | empty |
 | `TELEGRAM_TOPIC_ID` | Forum topic ID for groups with topics | empty |
-| `TELEGRAM_SEND_FILES` | Upload encrypted chunks and `SHA256SUMS` after backup | `false` |
+| `TELEGRAM_SEND_FILES` | Upload encrypted chunks, `SHA256SUMS`, and the restore manifest after backup | `false` |
 | `TELEGRAM_MAX_FILE_MB` | Maximum file size to upload, in MiB | `49` |
 | `TELEGRAM_SILENT` | Send notifications without sound | `false` |
 | `TELEGRAM_TIMEOUT` | Telegram HTTP timeout in seconds | `30` |
@@ -77,6 +80,7 @@ prompt.
 ```bash
 ./main.sh backup [chunk-size]
 ./main.sh restore /path/to/encrypted-folder
+./main.sh restore-telegram [manifest.tsv|telegram-file-id]
 ./main.sh telegram-test
 ./main.sh install-service
 ./main.sh uninstall-service
@@ -106,6 +110,10 @@ By default the backup is reduced to the encrypted chunks only:
 5. The unencrypted source folder is deleted (`CLEANUP_SOURCE=true`), and
    `docker-migration-latest` is pointed at the encrypted folder.
 
+When `TELEGRAM_SEND_FILES=true`, every uploaded file is also recorded in a
+restore manifest, and a copy is kept under `WORK_DIR` even if the local chunks
+are deleted. See [Restore from Telegram](#restore-from-telegram).
+
 Set `CLEANUP_AFTER_UPLOAD=true` to also delete the local chunks once all of
 them have been uploaded to Telegram. In that case the Telegram chat is the only
 copy. `RETENTION_COUNT` prunes old backup folders after each successful run.
@@ -128,6 +136,66 @@ You must type `yes` to continue.
 
 If the chunks were downloaded from Telegram, the folder name does not matter.
 The archive name is inferred from `SHA256SUMS`.
+
+### Restore from Telegram
+
+When `TELEGRAM_SEND_FILES=true`, the backup also writes and uploads a small
+manifest, `docker-migration-YYYYMMDD-HHMMSS-telegram-manifest.tsv`. It records
+the Telegram `file_id`, size, and SHA-256 of every uploaded file, plus the
+backup name.
+
+A copy is always kept at
+`${WORK_DIR}/docker-migration-YYYYMMDD-HHMMSS-telegram-manifest.tsv`, even when
+`CLEANUP_AFTER_UPLOAD=true` deletes the local chunks.
+
+`restore-telegram` reads that manifest, downloads every chunk from Telegram,
+verifies size and checksum, and then runs the normal restore flow:
+
+```bash
+# Same host: pick the newest local manifest automatically.
+sudo ./main.sh restore-telegram
+
+# Explicit manifest path.
+sudo ./main.sh restore-telegram /root/docker-migration-20260101-000000-telegram-manifest.tsv
+
+# New host: pass the manifest's Telegram file_id instead of downloading it.
+sudo ./main.sh restore-telegram BQACAgQAAx...
+```
+
+On a new host, download only the tiny manifest from the Telegram chat (or copy
+its `file_id`), or keep the manifest copy from the old host. Nothing else needs
+to be downloaded by hand. Already-downloaded chunks that match the manifest
+checksum are skipped, so an interrupted restore can be resumed. The files are
+kept in `${WORK_DIR}/<backup-name>-encrypted`.
+
+To get the manifest's `file_id` on a new host, forward the manifest document to
+the bot and read the latest update:
+
+```text
+https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
+```
+
+The manifest is a tab-separated text file:
+
+```text
+# docker-migration telegram manifest v1
+name	docker-migration-YYYYMMDD-HHMMSS
+host	old-vps
+created	2026-01-01T03:00:00+0700
+chunk_size	49m
+archive_sha256	<hash of the joined archive>
+complete	1
+file	SHA256SUMS	<size>	<sha256>	<file_id>	<file_unique_id>	<message_id>
+file	docker-migration-...part-0000	<size>	<sha256>	<file_id>	<file_unique_id>	<message_id>
+```
+
+A manifest with `complete 0` is rejected: it means at least one chunk failed to
+upload during backup.
+
+`restore-telegram` still needs `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in
+`.env`, but only the token is used to download files. The `file_id`s are tied
+to the bot that uploaded the backup. If you switch bots, the old manifest
+cannot be used; keep the current bot token or download the files by hand.
 
 ### Telegram
 
@@ -156,6 +224,12 @@ size below that, for example:
 ```bash
 sudo ./main.sh backup 45m
 ```
+
+After the chunks, the script uploads the restore manifest as the last document.
+If any chunk is rejected by Telegram (for example because it is larger than
+`TELEGRAM_MAX_FILE_MB`), the manifest is marked `complete 0` and
+`restore-telegram` refuses to use it. Local chunks are kept in that case, even
+with `CLEANUP_AFTER_UPLOAD=true`.
 
 ### Scheduled backups
 
@@ -204,22 +278,28 @@ sudo ./main.sh uninstall-service
 10. Split the encrypted archive into chunks and checksum them.
 11. Delete the archive and the unencrypted source (`KEEP_ARCHIVE`,
     `CLEANUP_SOURCE`).
-12. Send Telegram notifications and, optionally, upload the chunks.
+12. Send Telegram notifications and, optionally, upload the chunks with a
+    restore manifest containing their `file_id`s.
 13. Optionally delete the local chunks after a complete upload
     (`CLEANUP_AFTER_UPLOAD`) and prune old backups (`RETENTION_COUNT`).
 
 ### Restore
 
-1. Verify chunk checksums.
-2. Join the chunks into the encrypted archive.
-3. Decrypt the archive.
-4. Verify the backup checksums.
-5. Ask for confirmation.
-6. Stop all containers.
-7. Restore server configuration, Compose projects, images, volumes, and bind
+`restore` starts at step 2; `restore-telegram` runs step 1 first and then hands
+the downloaded folder to `restore`.
+
+1. (`restore-telegram` only) Read the manifest, download every listed file from
+   Telegram, and verify its size and SHA-256.
+2. Verify chunk checksums.
+3. Join the chunks into the encrypted archive.
+4. Decrypt the archive.
+5. Verify the backup checksums.
+6. Ask for confirmation.
+7. Stop all containers.
+8. Restore server configuration, Compose projects, images, volumes, and bind
    mounts.
-8. Start Compose projects and wait for PostgreSQL.
-9. Send a Telegram notification.
+9. Start Compose projects and wait for PostgreSQL.
+10. Send a Telegram notification.
 
 ## Limitations
 
@@ -230,6 +310,8 @@ sudo ./main.sh uninstall-service
   automatically.
 - Bind mounting `/` is rejected.
 - Restore overwrites existing data and server configuration.
+- `restore-telegram` needs the manifest file (or its `file_id`) and the same
+  bot token that uploaded the backup; Telegram `file_id`s are bot-specific.
 - Scheduling requires systemd.
 
 ## Security notes
