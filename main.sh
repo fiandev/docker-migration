@@ -396,17 +396,18 @@ tg_send_document() {
     # scaled with the file size instead of using the 30s message timeout.
     local upload_timeout=$((TELEGRAM_UPLOAD_TIMEOUT + size_bytes / 131072))
 
+    # Every text field must go through --form-string. With -F, curl treats
+    # a value that starts with '@' or '<' as a local file and fails with
+    # "curl: (26) Failed to open/read local data" before sending anything.
+    # That hit the HTML captions ("<b>...</b>") and chat IDs that start
+    # with '@' (channel usernames). Only the document itself uses -F.
     local -a args=(
-        -F "chat_id=${TELEGRAM_CHAT_ID}"
+        --form-string "chat_id=${TELEGRAM_CHAT_ID}"
         -F "document=@${file}"
     )
 
     if [[ -n "$caption" ]]; then
-        # --form-string is required here: -F treats a value that starts with
-        # '<' or '@' as a local file, so an HTML caption
-        # ("<b>...</b>") made curl fail with
-        # "curl: (26) Failed to open/read local data" on every upload.
-        args+=(--form-string "caption=${caption}" -F "parse_mode=HTML")
+        args+=(--form-string "caption=${caption}" --form-string "parse_mode=HTML")
     fi
 
     if [[ -n "$TELEGRAM_TOPIC_ID" ]]; then
