@@ -34,7 +34,7 @@ and can be reported or uploaded to Telegram through a bot.
 ## Installation
 
 ```bash
-git clone <repository-url> docker-migration
+git clone https://github.com/fiandev/docker-migration docker-migration
 cd docker-migration
 chmod +x main.sh
 
