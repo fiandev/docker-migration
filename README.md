@@ -14,6 +14,7 @@ and can be reported or uploaded to Telegram through a bot.
 - Bind mount discovery and backups
 - Docker Compose project backups
 - Server configuration backups (`/etc/nginx`, `/etc/letsencrypt`, `/etc/docker`)
+- Config-only restore for one or more host config paths
 - PostgreSQL logical dumps for the `psql` and `tcs-db` containers
 - AES-256 encrypted 7z archive with encrypted headers
 - Chunked archive output with `SHA256SUMS`
@@ -70,6 +71,7 @@ Variables already exported in the shell take precedence over `.env` values.
 | `CLEANUP_SOURCE` | Delete the unencrypted source folder after the archive is verified | `true` |
 | `CLEANUP_AFTER_UPLOAD` | Delete local chunks after Telegram confirms every upload | `false` |
 | `RETENTION_COUNT` | Keep only the newest N encrypted backups (`0` = all) | `0` |
+| `CONFIG_PATHS` | Space-separated absolute paths included in the config backup and available to `restore-config` | `/etc/nginx /etc/letsencrypt /etc/docker` |
 | `WORK_DIR` | Working directory for backups | `/root` |
 | `ENV_FILE` | Override the `.env` path | `<script-dir>/.env` |
 
@@ -82,6 +84,7 @@ prompt.
 ```bash
 ./main.sh backup [chunk-size]
 ./main.sh restore /path/to/encrypted-folder
+./main.sh restore-config /path/to/backup [config ...]
 ./main.sh restore-telegram [manifest.tsv|telegram-file-id]
 ./main.sh telegram-test
 ./main.sh install-service
@@ -132,12 +135,39 @@ Restore is destructive. It will:
 2. Overwrite the original Compose project directories.
 3. Delete and restore the contents of named volumes.
 4. Overwrite bind mount source directories.
-5. Restore server configuration under `/etc`.
+5. Restore server configuration from `CONFIG_PATHS`.
 
 You must type `yes` to continue.
 
 If the chunks were downloaded from Telegram, the folder name does not matter.
 The archive name is inferred from `SHA256SUMS`.
+
+### Config-only restore
+
+`restore` rebuilds everything. To apply only host configuration — for example
+nginx after moving a reverse proxy, without touching containers or volumes — use
+`restore-config`:
+
+```bash
+# Restore every config path from an encrypted backup.
+sudo ./main.sh restore-config /root/docker-migration-YYYYMMDD-HHMMSS-encrypted
+
+# Restore only /etc/nginx.
+sudo ./main.sh restore-config /root/docker-migration-YYYYMMDD-HHMMSS-encrypted nginx
+
+# Full paths also work.
+sudo ./main.sh restore-config /root/docker-migration-YYYYMMDD-HHMMSS-encrypted /etc/letsencrypt
+
+# An already extracted backup tree works too (no decryption needed).
+sudo ./main.sh restore-config /root/docker-restore.XXXXXX/docker-migration-YYYYMMDD-HHMMSS
+```
+
+Container, image, volume, bind mount, and Compose data are not touched. The
+command lists the matching config paths and asks for confirmation before
+overwriting files. When `/etc/nginx` is restored and `nginx` is installed, the
+config is validated with `nginx -t` and the service is reloaded. A changed
+`/etc/docker` is not restarted automatically; run `systemctl restart docker`
+when you are ready.
 
 ### Restore from Telegram
 

@@ -17,6 +17,7 @@ umask 077
 # Usage:
 #   ./main.sh backup [chunk-size]
 #   ./main.sh restore /path/to/encrypted-folder
+#   ./main.sh restore-config /path/to/backup [config ...]
 #   ./main.sh restore-telegram [manifest|file-id]
 #   ./main.sh telegram-test
 #   ./main.sh install-service
@@ -83,6 +84,16 @@ RETENTION_COUNT="${RETENTION_COUNT:-0}"
 WORK_DIR="${WORK_DIR:-/root}"
 LATEST_FILE="${LATEST_FILE:-${WORK_DIR}/docker-migration-latest}"
 
+# Host configuration paths included in every backup. restore-config can
+# restore all of them or a single one (for example: nginx).
+read -r -a CONFIG_PATHS <<< "${CONFIG_PATHS:-/etc/nginx /etc/letsencrypt /etc/docker}"
+
+# Temporary state used while unpacking a backup. These are global on
+# purpose: the EXIT trap must still see them after the calling function
+# returns, otherwise the temp directory leaks (and set -u crashes the trap).
+RESTORE_TEMP=""
+UNPACKED_BACKUP=""
+
 SEVENZIP="$(command -v 7z || command -v 7zz || true)"
 
 # Telegram state (populated by init_telegram).
@@ -135,6 +146,19 @@ require_commands() {
 
     docker compose version >/dev/null 2>&1 \
         || die "Docker Compose plugin is not available."
+}
+
+# Config-only restore needs the archive tools but not a running Docker
+# daemon, because it does not touch containers, volumes, or images.
+require_config_commands() {
+    local cmd
+
+    for cmd in tar split sha256sum base64 realpath; do
+        command -v "$cmd" >/dev/null 2>&1 \
+            || die "Command not found: $cmd"
+    done
+
+    [[ -n "$SEVENZIP" ]] || die "7z/7zz not found."
 }
 
 install_service() {
@@ -235,6 +259,34 @@ encode() {
 
 decode() {
     printf '%s' "$1" | base64 -d
+}
+
+cleanup_restore_temp() {
+    if [[ -n "${RESTORE_TEMP:-}" && -d "$RESTORE_TEMP" ]]; then
+        rm -rf -- "$RESTORE_TEMP"
+    fi
+
+    RESTORE_TEMP=""
+}
+
+# Extract one host-config archive into its original location. New backups
+# store paths relative to /, while older backups were built relative to the
+# parent directory (/etc/nginx was stored as nginx/...). Detect the layout
+# so both formats end up in the right place.
+extract_config_archive() {
+    local archive="$1"
+    local target="$2"
+    local first
+
+    first="$(tar -tzf "$archive" | sed -n '1p')"
+    first="${first#./}"
+
+    if [[ "$first" == "$(basename "$target")" ||
+        "$first" == "$(basename "$target")/"* ]]; then
+        tar -xzf "$archive" -C "$(dirname "$target")"
+    else
+        tar -xzf "$archive" -C /
+    fi
 }
 
 # ============================================================
@@ -988,18 +1040,32 @@ backup() {
 
     echo "[7/13] Server configurations..."
 
-    for path in /etc/nginx /etc/letsencrypt /etc/docker; do
+    : > "$BACKUP/config/manifest.tsv"
+
+    for path in "${CONFIG_PATHS[@]}"; do
 
         [[ -e "$path" ]] || continue
+
+        path="${path%/}"
+
+        [[ "$path" == /* && "$path" != "/" ]] \
+            || die "Invalid config path: $path"
 
         local filename
         filename="$(printf '%s' "$path" | sed 's#/#_#g')"
 
         echo "Backup: $path"
 
+        printf '%s\t%s\n' \
+            "$(encode "$path")" \
+            "${filename}.tar.gz" \
+            >> "$BACKUP/config/manifest.tsv"
+
+        # Store the path relative to / so restore works for any config
+        # directory, not only the ones directly under /etc.
         tar -czf "$BACKUP/config/${filename}.tar.gz" \
-            -C "$(dirname "$path")" \
-            "$(basename "$path")"
+            -C / \
+            "${path#/}"
     done
 
     # --------------------------------------------------------
@@ -1282,91 +1348,84 @@ backup() {
 # RESTORE
 # ============================================================
 
-restore() {
-    local INPUT="${2:-}"
+# Verify the chunks, join them, decrypt the archive, and verify the
+# extracted tree. Sets UNPACKED_BACKUP to the extracted backup and
+# RESTORE_TEMP to the temporary directory (removed by the EXIT trap).
+unpack_backup() {
+    local input="${1:-}"
 
-    [[ -n "$INPUT" && -d "$INPUT" ]] \
-        || die "Usage: $0 restore /path/to/encrypted-folder"
+    [[ -n "$input" && -d "$input" ]] \
+        || die "Backup folder not found: ${input:-<empty>}"
 
-    INPUT="$(realpath "$INPUT")"
+    input="$(realpath "$input")"
 
-    local NAME
-    NAME="$(basename "$INPUT" -encrypted)"
+    local name
+    name="$(basename "$input" -encrypted)"
 
     # The folder may have been renamed (for example after downloading
     # the chunks from Telegram). Infer the archive name from SHA256SUMS.
-    if [[ -f "$INPUT/SHA256SUMS" ]]; then
+    if [[ -f "$input/SHA256SUMS" ]]; then
         local first_chunk
-        first_chunk="$(awk 'NR == 1 { print $2 }' "$INPUT/SHA256SUMS")"
+        first_chunk="$(awk 'NR == 1 { print $2 }' "$input/SHA256SUMS")"
 
         if [[ "$first_chunk" == *.part-* ]]; then
-            NAME="${first_chunk%%.part-*}"
+            name="${first_chunk%%.part-*}"
         fi
     fi
 
-    local TEMP
-    TEMP="$(mktemp -d "${WORK_DIR}/docker-restore.XXXXXX")"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "Invalid backup name: $name"
 
-    local ARCHIVE
-    ARCHIVE="$TEMP/${NAME}.7z"
+    RESTORE_TEMP="$(mktemp -d "${WORK_DIR}/docker-restore.XXXXXX")"
 
-    local BACKUP
-    BACKUP="$TEMP/$NAME"
+    local archive
+    archive="$RESTORE_TEMP/${name}.7z"
 
-    cleanup() {
-        rm -rf -- "$TEMP"
-    }
-
-    trap cleanup EXIT
-
-    echo
-    echo "========================================"
-    echo " DOCKER MIGRATION RESTORE"
-    echo "========================================"
-
-    echo "Input: $INPUT"
+    local backup
+    backup="$RESTORE_TEMP/${name}"
 
     # --------------------------------------------------------
-    # 1. Verify chunk checksums
+    # Verify chunk checksums
     # --------------------------------------------------------
 
     echo
-    echo "[1/10] Verifying chunk checksums..."
+    echo "[1/4] Verifying chunk checksums..."
 
-    [[ -f "$INPUT/SHA256SUMS" ]] \
+    [[ -f "$input/SHA256SUMS" ]] \
         || die "SHA256SUMS not found."
 
     (
-        cd "$INPUT"
+        cd "$input"
         sha256sum -c SHA256SUMS
     ) || die "Chunk checksum is not valid."
 
     # --------------------------------------------------------
-    # 2. Reconstruct archive
+    # Reconstruct archive
     # --------------------------------------------------------
 
     echo
-    echo "[2/10] Joining chunks..."
+    echo "[2/4] Joining chunks..."
 
-    mapfile -t CHUNKS < <(
-        find "$INPUT" -maxdepth 1 \
-            -type f -name "${NAME}.part-*" \
+    local -a chunks=()
+    mapfile -t chunks < <(
+        find "$input" -maxdepth 1 \
+            -type f -name "${name}.part-*" \
             | sort
     )
 
-    ((${#CHUNKS[@]})) \
+    ((${#chunks[@]})) \
         || die "Archive chunks not found."
 
-    cat "${CHUNKS[@]}" > "$ARCHIVE"
+    cat "${chunks[@]}" > "$archive"
 
     # --------------------------------------------------------
-    # 3. Decrypt archive
+    # Decrypt archive
     # --------------------------------------------------------
 
     echo
-    echo "[3/10] Decrypting archive..."
+    echo "[3/4] Decrypting archive..."
 
-    local -a sevenzip_args=(x "$ARCHIVE" "-o$TEMP")
+    local -a sevenzip_args=(x "$archive" "-o$RESTORE_TEMP")
 
     if [[ -n "${BACKUP_PASSWORD:-}" ]]; then
         sevenzip_args+=("-p${BACKUP_PASSWORD}")
@@ -1376,26 +1435,46 @@ restore() {
     "$SEVENZIP" "${sevenzip_args[@]}" \
         || die "Decryption failed."
 
-    [[ -d "$BACKUP" ]] \
+    [[ -d "$backup" ]] \
         || die "Backup folder not found."
 
     # --------------------------------------------------------
-    # 4. Verify backup content
+    # Verify backup content
     # --------------------------------------------------------
 
     echo
-    echo "[4/10] Verifying backup contents..."
+    echo "[4/4] Verifying backup contents..."
 
-    [[ -f "$BACKUP/SHA256SUMS" ]] \
+    [[ -f "$backup/SHA256SUMS" ]] \
         || die "Backup SHA256SUMS not found."
 
     (
-        cd "$BACKUP"
+        cd "$backup"
         sha256sum -c SHA256SUMS
     ) || die "Backup checksum is not valid."
 
+    UNPACKED_BACKUP="$backup"
+}
+
+restore() {
+    local INPUT="${2:-}"
+
+    echo
+    echo "========================================"
+    echo " DOCKER MIGRATION RESTORE"
+    echo "========================================"
+
+    echo "Input: $INPUT"
+
+    trap cleanup_restore_temp EXIT
+
+    unpack_backup "$INPUT"
+
+    local BACKUP
+    BACKUP="$UNPACKED_BACKUP"
+
     # --------------------------------------------------------
-    # 5. Destructive operation confirmation
+    # Destructive operation confirmation
     # --------------------------------------------------------
 
     echo
@@ -1420,7 +1499,7 @@ restore() {
     # --------------------------------------------------------
 
     echo
-    echo "[5/10] Stopping all containers..."
+    echo "[1/6] Stopping all containers..."
 
     docker ps -q | while IFS= read -r id; do
         [[ -n "$id" ]] || continue
@@ -1432,21 +1511,47 @@ restore() {
     # --------------------------------------------------------
 
     echo
-    echo "[6/10] Restoring server configurations..."
+    echo "[2/6] Restoring server configurations..."
 
-    for archive in "$BACKUP"/config/*.tar.gz; do
+    if [[ -f "$BACKUP/config/manifest.tsv" ]]; then
 
-        [[ -f "$archive" ]] || continue
+        while IFS=$'\t' read -r encoded filename; do
 
-        tar -xzf "$archive" -C /
-    done
+            [[ -n "$encoded" && -n "$filename" ]] || continue
+            [[ -f "$BACKUP/config/$filename" ]] || continue
+
+            local target
+            target="$(decode "$encoded")"
+
+            [[ "$target" == /* && "$target" != "/" ]] \
+                || die "Invalid config path: $target"
+
+            echo "Restore config: $target"
+
+            extract_config_archive "$BACKUP/config/$filename" "$target"
+
+        done < "$BACKUP/config/manifest.tsv"
+    else
+
+        # Older backups have no manifest. The file name encodes the path
+        # (/etc/nginx is stored as _etc_nginx.tar.gz).
+        for archive in "$BACKUP"/config/*.tar.gz; do
+
+            [[ -f "$archive" ]] || continue
+
+            local filename
+            filename="$(basename "$archive" .tar.gz)"
+
+            extract_config_archive "$archive" "/${filename//_//}"
+        done
+    fi
 
     # --------------------------------------------------------
     # 8. Restore Compose projects
     # --------------------------------------------------------
 
     echo
-    echo "[7/10] Restore Compose projects..."
+    echo "[3/6] Restore Compose projects..."
 
     if [[ -f "$BACKUP/compose/projects.tsv" ]]; then
 
@@ -1481,7 +1586,7 @@ restore() {
     # --------------------------------------------------------
 
     echo
-    echo "[8/10] Restore Docker images..."
+    echo "[4/6] Restore Docker images..."
 
     if [[ -f "$BACKUP/images/all-images.tar" ]]; then
 
@@ -1565,7 +1670,7 @@ restore() {
     # --------------------------------------------------------
 
     echo
-    echo "[9/10] Starting Compose projects..."
+    echo "[5/6] Starting Compose projects..."
 
     if [[ -f "$BACKUP/compose/projects.tsv" ]]; then
 
@@ -1656,7 +1761,7 @@ restore() {
     # --------------------------------------------------------
 
     echo
-    echo "[10/10] Restore completed."
+    echo "[6/6] Restore completed."
 
     echo
     echo "========================================"
@@ -1689,6 +1794,190 @@ restore() {
     echo "Duration: $(format_duration "$duration")"
 
     tg_notify_restore "$INPUT" "$duration"
+}
+
+# ============================================================
+# CONFIG-ONLY RESTORE
+# ============================================================
+
+# Restore only the host configuration (nginx, Let's Encrypt, Docker, or
+# whatever CONFIG_PATHS contains) without touching containers, images,
+# volumes, bind mounts, or Compose projects.
+#
+# INPUT may be an encrypted backup folder or an already extracted backup.
+# The remaining arguments filter which config paths are restored:
+#   restore-config /path/to/backup nginx
+#   restore-config /path/to/backup /etc/letsencrypt
+restore_config() {
+    local INPUT="${2:-}"
+    local -a WANTED=("${@:3}")
+
+    [[ -n "$INPUT" ]] \
+        || die "Usage: $0 restore-config /backup [config ...]"
+
+    local START=$SECONDS
+
+    echo
+    echo "========================================"
+    echo " CONFIG-ONLY RESTORE"
+    echo "========================================"
+
+    echo "Input: $INPUT"
+
+    trap cleanup_restore_temp EXIT
+
+    local BACKUP
+
+    if [[ -d "$INPUT/config" && -f "$INPUT/SHA256SUMS" ]]; then
+        BACKUP="$(realpath "$INPUT")"
+
+        echo "Using extracted backup: $BACKUP"
+
+        echo
+        echo "Verifying config checksums..."
+
+        (
+            cd "$BACKUP"
+            grep -E ' \./config/' SHA256SUMS | sha256sum -c -
+        ) || die "Config checksum is not valid."
+    else
+        unpack_backup "$INPUT"
+        BACKUP="$UNPACKED_BACKUP"
+    fi
+
+    [[ -d "$BACKUP/config" ]] \
+        || die "No config archives in backup: $BACKUP/config"
+
+    local -a ARCHIVES=()
+    local -a TARGETS=()
+    local archive filename encoded target
+
+    if [[ -f "$BACKUP/config/manifest.tsv" ]]; then
+
+        while IFS=$'\t' read -r encoded filename; do
+
+            [[ -n "$encoded" && -n "$filename" ]] || continue
+            [[ -f "$BACKUP/config/$filename" ]] || continue
+
+            target="$(decode "$encoded")"
+
+            [[ "$target" == /* && "$target" != "/" ]] \
+                || die "Invalid config path: $target"
+
+            ARCHIVES+=("$BACKUP/config/$filename")
+            TARGETS+=("$target")
+
+        done < "$BACKUP/config/manifest.tsv"
+    else
+
+        warn "config/manifest.tsv is missing (old backup); config paths are inferred from file names."
+
+        for archive in "$BACKUP"/config/*.tar.gz; do
+
+            [[ -f "$archive" ]] || continue
+
+            filename="$(basename "$archive" .tar.gz)"
+
+            ARCHIVES+=("$archive")
+            TARGETS+=("/${filename//_//}")
+        done
+    fi
+
+    ((${#ARCHIVES[@]})) \
+        || die "No config archives found in: $BACKUP/config"
+
+    local -a SELECTED_ARCHIVES=()
+    local -a SELECTED_TARGETS=()
+    local i want matched
+
+    for i in "${!ARCHIVES[@]}"; do
+
+        target="${TARGETS[$i]}"
+
+        if ((${#WANTED[@]})); then
+            matched=0
+
+            for want in "${WANTED[@]}"; do
+                want="${want#/}"
+                want="${want%/}"
+
+                [[ -n "$want" ]] || continue
+
+                if [[ "$target" == "/$want" ||
+                    "$target" == "/$want/"* ||
+                    "$(basename "$target")" == "$want" ||
+                    "$(basename "${ARCHIVES[$i]}" .tar.gz)" == "$want" ]]; then
+                    matched=1
+                    break
+                fi
+            done
+
+            ((matched)) || continue
+        fi
+
+        SELECTED_ARCHIVES+=("${ARCHIVES[$i]}")
+        SELECTED_TARGETS+=("$target")
+    done
+
+    ((${#SELECTED_ARCHIVES[@]})) \
+        || die "No config archive matches: ${WANTED[*]:-}"
+
+    echo
+    echo "Config paths that will be restored:"
+
+    for i in "${!SELECTED_TARGETS[@]}"; do
+        printf '  %s\n' "${SELECTED_TARGETS[$i]}"
+    done
+
+    echo
+    echo "Existing files in these paths will be overwritten."
+    echo "Containers, images, volumes, and Compose projects are not touched."
+
+    confirm "Continue with config restore?"
+
+    for i in "${!SELECTED_ARCHIVES[@]}"; do
+
+        target="${SELECTED_TARGETS[$i]}"
+
+        echo "Restore config: $target"
+
+        extract_config_archive "${SELECTED_ARCHIVES[$i]}" "$target"
+    done
+
+    # Apply the new nginx configuration when nginx is installed. Docker
+    # needs a daemon restart, which is left to the operator on purpose.
+    for target in "${SELECTED_TARGETS[@]}"; do
+
+        case "$target" in
+            /etc/nginx)
+                if command -v nginx >/dev/null 2>&1; then
+                    echo "Validating nginx configuration..."
+
+                    if nginx -t; then
+                        systemctl reload nginx 2>/dev/null \
+                            || nginx -s reload \
+                            || warn "Could not reload nginx automatically."
+                    else
+                        warn "nginx -t failed; nginx was not reloaded."
+                    fi
+                else
+                    warn "nginx is not installed on this host; reload the nginx service or container to apply the config."
+                fi
+                ;;
+
+            /etc/docker)
+                warn "Docker configuration changed. Run 'systemctl restart docker' to apply it."
+                ;;
+        esac
+    done
+
+    local duration=$((SECONDS - START))
+
+    echo
+    echo "========================================"
+    echo " CONFIG RESTORE COMPLETE"
+    echo "========================================"
+    echo "Duration: $(format_duration "$duration")"
 }
 
 # ============================================================
@@ -1852,6 +2141,7 @@ Docker Migration Manager
 Usage:
   ${script} backup [chunk-size]
   ${script} restore /path/to/encrypted-folder
+  ${script} restore-config /path/to/backup [config ...]
   ${script} restore-telegram [manifest.tsv|telegram-file-id]
   ${script} telegram-test
   ${script} install-service
@@ -1863,6 +2153,8 @@ Config:
 Examples:
   ${script} backup 19m
   ${script} restore /root/docker-migration-xxx-encrypted
+  ${script} restore-config /root/docker-migration-xxx-encrypted nginx
+  ${script} restore-config /root/docker-restore.xxx/docker-migration-xxx
   ${script} restore-telegram
   ${script} restore-telegram /root/docker-migration-xxx-telegram-manifest.tsv
 EOF
@@ -1886,6 +2178,12 @@ case "$MODE" in
         require_commands
         RESTORE_START=$SECONDS
         restore "$@"
+        ;;
+
+    restore-config)
+        require_root
+        require_config_commands
+        restore_config "$@"
         ;;
 
     restore-telegram)
