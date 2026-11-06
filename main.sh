@@ -69,7 +69,10 @@ load_env() {
 
 load_env
 
-CHUNK_SIZE="${DEFAULT_CHUNK_SIZE:-50m}"
+# Bot API downloads (getFile) are capped at 20 MB per file even though
+# uploads may be 50 MB. Chunks must stay below the download cap, or
+# restore-telegram cannot fetch them back.
+CHUNK_SIZE="${DEFAULT_CHUNK_SIZE:-19m}"
 
 # Storage hygiene.
 KEEP_ARCHIVE="${KEEP_ARCHIVE:-false}"
@@ -238,7 +241,10 @@ decode() {
 # TELEGRAM NOTIFICATIONS
 # ============================================================
 
-TELEGRAM_API_BASE="https://api.telegram.org"
+# Point this at a local Bot API server (TELEGRAM_LOCAL=1) to lift the
+# 20 MB download cap to 2000 MB.
+TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+TELEGRAM_DOWNLOAD_MAX_MB="${TELEGRAM_DOWNLOAD_MAX_MB:-20}"
 
 is_true() {
     case "${1,,}" in
@@ -271,12 +277,16 @@ init_telegram() {
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
     TELEGRAM_TOPIC_ID="${TELEGRAM_TOPIC_ID:-}"
-    TELEGRAM_MAX_FILE_MB="${TELEGRAM_MAX_FILE_MB:-49}"
+    TELEGRAM_MAX_FILE_MB="${TELEGRAM_MAX_FILE_MB:-19}"
+    TELEGRAM_DOWNLOAD_MAX_MB="${TELEGRAM_DOWNLOAD_MAX_MB:-20}"
     TELEGRAM_TIMEOUT="${TELEGRAM_TIMEOUT:-30}"
     TELEGRAM_UPLOAD_TIMEOUT="${TELEGRAM_UPLOAD_TIMEOUT:-120}"
 
     [[ "$TELEGRAM_MAX_FILE_MB" =~ ^[0-9]+$ ]] \
-        || TELEGRAM_MAX_FILE_MB=49
+        || TELEGRAM_MAX_FILE_MB=19
+
+    [[ "$TELEGRAM_DOWNLOAD_MAX_MB" =~ ^[0-9]+$ ]] \
+        || TELEGRAM_DOWNLOAD_MAX_MB=20
 
     [[ "$TELEGRAM_TIMEOUT" =~ ^[0-9]+$ ]] \
         || TELEGRAM_TIMEOUT=30
@@ -379,9 +389,17 @@ tg_get_file_path() {
 
     TG_FILE_PATH=""
 
-    tg_api getFile \
-        --data-urlencode "file_id=${file_id}" \
-        || return 1
+    if ! tg_api getFile \
+        --data-urlencode "file_id=${file_id}"; then
+
+        # getFile answers "file is too big" above the download cap. Give
+        # the operator a way out instead of a bare HTTP 400.
+        if [[ "${TG_LAST_RESPONSE:-}" == *"file is too big"* ]]; then
+            warn "Bot API downloads are limited to ${TELEGRAM_DOWNLOAD_MAX_MB}MB per file, but this backup was uploaded with larger chunks. Re-upload with a smaller chunk size (for example 'backup 19m') or point TELEGRAM_API_BASE at a local Bot API server."
+        fi
+
+        return 1
+    fi
 
     TG_FILE_PATH="$(tg_json_string file_path)"
 
@@ -587,8 +605,22 @@ tg_notify_backup() {
     local -a file_rows=()
 
     local file expected_sha
+    local download_warned=0
+
     for file in "${output}/SHA256SUMS" "${output}/${name}.part-"*; do
         [[ -f "$file" ]] || continue
+
+        # Uploads allow 50 MB, but getFile stops at 20 MB by default: a
+        # chunk above that cap uploads fine and then fails on restore.
+        if ((download_warned == 0)) && [[ "$(basename "$file")" == *.part-* ]]; then
+            local part_bytes
+            part_bytes="$(stat -c %s "$file")"
+
+            if ((part_bytes > TELEGRAM_DOWNLOAD_MAX_MB * 1024 * 1024)); then
+                download_warned=1
+                warn "Chunk size exceeds the ${TELEGRAM_DOWNLOAD_MAX_MB}MB Bot API download limit; restore-telegram will fail. Use a chunk size of ${TELEGRAM_DOWNLOAD_MAX_MB}m or less, or a local Bot API server."
+            fi
+        fi
 
         expected_sha="$(awk -v f="$(basename "$file")" \
             '$2 == f { print $1; exit }' \
@@ -1829,7 +1861,7 @@ Config:
   ${ENV_FILE}
 
 Examples:
-  ${script} backup 45m
+  ${script} backup 19m
   ${script} restore /root/docker-migration-xxx-encrypted
   ${script} restore-telegram
   ${script} restore-telegram /root/docker-migration-xxx-telegram-manifest.tsv

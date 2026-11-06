@@ -57,13 +57,15 @@ Variables already exported in the shell take precedence over `.env` values.
 | `TELEGRAM_CHAT_ID` | Target chat, group, or channel ID | empty |
 | `TELEGRAM_TOPIC_ID` | Forum topic ID for groups with topics | empty |
 | `TELEGRAM_SEND_FILES` | Upload encrypted chunks, `SHA256SUMS`, and the restore manifest after backup | `false` |
-| `TELEGRAM_MAX_FILE_MB` | Maximum file size to upload, in MiB | `49` |
+| `TELEGRAM_MAX_FILE_MB` | Maximum file size to upload, in MiB | `19` |
+| `TELEGRAM_DOWNLOAD_MAX_MB` | Maximum file size the Bot API can download, in MiB; chunks must stay at or below this | `20` |
+| `TELEGRAM_API_BASE` | Bot API base URL; point it at a local Bot API server to lift the 20 MB download cap | `https://api.telegram.org` |
 | `TELEGRAM_SILENT` | Send notifications without sound | `false` |
 | `TELEGRAM_TIMEOUT` | Telegram HTTP timeout in seconds | `30` |
 | `TELEGRAM_UPLOAD_TIMEOUT` | Base timeout for document uploads in seconds; grows with file size | `120` |
 | `TELEGRAM_REQUIRED` | Fail when Telegram is not configured | `false` |
 | `BACKUP_PASSWORD` | Archive encryption password | empty |
-| `DEFAULT_CHUNK_SIZE` | Default chunk size when no CLI argument is given | `50m` |
+| `DEFAULT_CHUNK_SIZE` | Default chunk size when no CLI argument is given | `19m` |
 | `KEEP_ARCHIVE` | Keep the full `.7z` next to the chunks | `false` |
 | `CLEANUP_SOURCE` | Delete the unencrypted source folder after the archive is verified | `true` |
 | `CLEANUP_AFTER_UPLOAD` | Delete local chunks after Telegram confirms every upload | `false` |
@@ -90,7 +92,7 @@ prompt.
 ### Backup
 
 ```bash
-sudo ./main.sh backup 45m
+sudo ./main.sh backup 19m
 ```
 
 The script creates two directories under `WORK_DIR`:
@@ -182,7 +184,7 @@ The manifest is a tab-separated text file:
 name	docker-migration-YYYYMMDD-HHMMSS
 host	old-vps
 created	2026-01-01T03:00:00+0700
-chunk_size	49m
+chunk_size	19m
 archive_sha256	<hash of the joined archive>
 complete	1
 file	SHA256SUMS	<size>	<sha256>	<file_id>	<file_unique_id>	<message_id>
@@ -215,14 +217,31 @@ To upload the encrypted chunks automatically:
 
 ```dotenv
 TELEGRAM_SEND_FILES=true
-TELEGRAM_MAX_FILE_MB=49
+TELEGRAM_MAX_FILE_MB=19
 ```
 
-The Telegram Bot API allows at most 50 MB per uploaded document. Use a chunk
-size below that, for example:
+Two different Bot API limits apply, and they are easy to mix up:
+
+- **Upload** (`sendDocument`) accepts up to 50 MB per file.
+- **Download** (`getFile`) only accepts files up to **20 MB**.
+
+A 49 MB chunk therefore uploads fine and then fails on restore with
+`Bad Request: file is too big`. Keep chunks at or below the download limit;
+`19m` leaves a safety margin:
 
 ```bash
-sudo ./main.sh backup 45m
+sudo ./main.sh backup 19m
+```
+
+The backup warns when a chunk exceeds `TELEGRAM_DOWNLOAD_MAX_MB`. To restore a
+backup that was already uploaded with larger chunks, either re-upload it with
+`19m` chunks or point `TELEGRAM_API_BASE` at a local Bot API server started with
+`TELEGRAM_LOCAL=1` (it allows downloads up to 2000 MB and keeps the same
+`file_id`s):
+
+```dotenv
+TELEGRAM_API_BASE=http://127.0.0.1:8081
+TELEGRAM_DOWNLOAD_MAX_MB=2000
 ```
 
 After the chunks, the script uploads the restore manifest as the last document.
