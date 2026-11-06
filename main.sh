@@ -1546,6 +1546,12 @@ restore() {
         done
     fi
 
+    # Apply a restored host nginx config instead of leaving it untested.
+    # Containerized nginx is reloaded later by Compose.
+    if [[ -f "$BACKUP/config/_etc_nginx.tar.gz" ]]; then
+        apply_nginx_config
+    fi
+
     # --------------------------------------------------------
     # 8. Restore Compose projects
     # --------------------------------------------------------
@@ -1800,6 +1806,84 @@ restore() {
 # CONFIG-ONLY RESTORE
 # ============================================================
 
+# First existing account to use when a restored nginx config names a user
+# that only exists on the source host. NGINX_USER overrides the search.
+nginx_user_candidate() {
+    local missing="$1"
+    local candidate
+
+    for candidate in "${NGINX_USER:-}" www-data nginx http nobody; do
+        [[ -n "$candidate" && "$candidate" != "$missing" ]] || continue
+
+        if id -u "$candidate" >/dev/null 2>&1; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Validate and reload nginx after its config was restored. A config from
+# another distribution often contains a user directive that does not exist
+# here (Alpine/RHEL use "nginx", Debian/Ubuntu use "www-data"), which makes
+# nginx -t fail with getpwnam(). Rewrite only that directive and test again.
+apply_nginx_config() {
+    if ! command -v nginx >/dev/null 2>&1; then
+        echo "nginx is not installed on this host; skipping validation (reload the container or service yourself)."
+        return 0
+    fi
+
+    echo "Validating nginx configuration..."
+
+    local output
+    if output="$(nginx -t 2>&1)"; then
+        systemctl reload nginx 2>/dev/null \
+            || nginx -s reload \
+            || warn "Could not reload nginx automatically."
+        return 0
+    fi
+
+    warn "nginx -t failed:"
+    printf '%s\n' "$output" >&2
+
+    local pattern='getpwnam\("?([^)"]+)"?\) failed in ([^:]+):[0-9]+'
+
+    if [[ ! "$output" =~ $pattern ]]; then
+        warn "Fix the error above, then reload nginx."
+        return 0
+    fi
+
+    local missing="${BASH_REMATCH[1]}"
+    local file="${BASH_REMATCH[2]}"
+    local candidate
+
+    if ! candidate="$(nginx_user_candidate "$missing")"; then
+        warn "User '$missing' does not exist and no replacement was found. Set NGINX_USER in ${ENV_FILE} and re-run."
+        return 0
+    fi
+
+    echo "User '$missing' does not exist on this host; switching to '$candidate' in $file"
+
+    cp -a -- "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)"
+
+    sed -i -E \
+        "s#^([[:space:]]*)user[[:space:]]+[^;]+;#\\1user ${candidate};#" \
+        "$file"
+
+    if output="$(nginx -t 2>&1)"; then
+        echo "nginx configuration is valid."
+
+        systemctl reload nginx 2>/dev/null \
+            || nginx -s reload \
+            || warn "Could not reload nginx automatically."
+    else
+        warn "nginx -t still failed after switching to user '$candidate':"
+        printf '%s\n' "$output" >&2
+        warn "Fix the error above, then reload nginx."
+    fi
+}
+
 # Restore only the host configuration (nginx, Let's Encrypt, Docker, or
 # whatever CONFIG_PATHS contains) without touching containers, images,
 # volumes, bind mounts, or Compose projects.
@@ -1950,19 +2034,7 @@ restore_config() {
 
         case "$target" in
             /etc/nginx)
-                if command -v nginx >/dev/null 2>&1; then
-                    echo "Validating nginx configuration..."
-
-                    if nginx -t; then
-                        systemctl reload nginx 2>/dev/null \
-                            || nginx -s reload \
-                            || warn "Could not reload nginx automatically."
-                    else
-                        warn "nginx -t failed; nginx was not reloaded."
-                    fi
-                else
-                    warn "nginx is not installed on this host; reload the nginx service or container to apply the config."
-                fi
+                apply_nginx_config
                 ;;
 
             /etc/docker)

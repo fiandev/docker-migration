@@ -165,9 +165,13 @@ sudo ./main.sh restore-config /root/docker-restore.XXXXXX/docker-migration-YYYYM
 Container, image, volume, bind mount, and Compose data are not touched. The
 command lists the matching config paths and asks for confirmation before
 overwriting files. When `/etc/nginx` is restored and `nginx` is installed, the
-config is validated with `nginx -t` and the service is reloaded. A changed
-`/etc/docker` is not restarted automatically; run `systemctl restart docker`
-when you are ready.
+config is validated with `nginx -t` and the service is reloaded. If the restored
+config names a user that does not exist on this host (for example `user nginx;`
+from Alpine/RHEL on a Debian/Ubuntu host), that directive is rewritten to an
+existing account (`www-data`, `nginx`, `http`, or `nobody`) and the old file is
+kept as a timestamped `.bak`. Set `NGINX_USER` to choose the account explicitly.
+A changed `/etc/docker` is not restarted automatically; run
+`systemctl restart docker` when you are ready.
 
 ### Restore from Telegram
 
